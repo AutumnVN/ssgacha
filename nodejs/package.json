@@ -1,0 +1,26 @@
+{
+  "name": "ssgacha",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "test": "node --check index.js",
+    "start": "node index.js",
+    "bundle": "esbuild index.js --bundle --platform=node --format=cjs --target=node25 --outfile=dist/gacha.cjs",
+    "build": "pnpm run bundle && node --build-sea sea-config.json"
+  },
+  "engines": {
+    "node": ">=25.5.0"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "MIT",
+  "description": "Fetch Stella Sora recruitment history for every banner.",
+  "dependencies": {
+    "protobufjs": "^8.8.1"
+  },
+  "private": true,
+  "packageManager": "pnpm@12.4.2",
+  "devDependencies": {
+    "esbuild": "^0.28.2"
+  }
+}

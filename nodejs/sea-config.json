@@ -1,0 +1,5 @@
+{
+  "main": "dist/gacha.cjs",
+  "output": "dist/gacha.exe",
+  "disableExperimentalSEAWarning": true
+}
