@@ -18,6 +18,8 @@ use crate::regions::{AuthMode, LoginField, Region, CLIENT_VERSION, DEVICE_MODEL}
 pub const MSG_LOGIN_REQ: u16 = 4;
 pub const MSG_LOGIN_SUCCEED_ACK: u16 = 5;
 pub const MSG_LOGIN_FAILED_ACK: u16 = 6;
+pub const MSG_PLAYER_DATA_REQ: u16 = 1001;
+pub const MSG_PLAYER_DATA_SUCCEED_ACK: u16 = 1002;
 pub const MSG_GACHA_INFORMATION_REQ: u16 = 6004;
 pub const MSG_GACHA_INFORMATION_SUCCEED_ACK: u16 = 6005;
 pub const MSG_GACHA_HISTORIES_REQ: u16 = 6007;

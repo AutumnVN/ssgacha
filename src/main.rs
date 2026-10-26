@@ -11,22 +11,57 @@ use std::collections::BTreeSet;
 use std::io::{IsTerminal, Write};
 use std::time::Duration;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use prost::Message;
 
 use crate::credentials::{find_yosdk_credentials, region_credentials, Credentials};
 use crate::metadata::{build_catalog, load_metadata, OutputError, OutputErrorKey};
 use crate::net::{do_ike_handshake, with_retry, IkeResult};
 use crate::output::{
-    build_region_output, load_existing_region, output_file_for_region, write_region_output,
+    build_region_output, load_existing_region, output_file_for_account, write_region_output,
     FetchedRegion, Pull,
 };
-use crate::proto::{GachaHistories, GachaInformationResp, Ui32};
+use crate::proto::{GachaHistories, GachaInformationResp, PlayerInfo, Ui32};
 use crate::regions::{region_by_key, Region, REGION_ORDER};
 use crate::sdk::{
     do_player_login, get_account_login_token, send_game_request, MSG_GACHA_HISTORIES_REQ,
     MSG_GACHA_HISTORIES_SUCCEED_ACK, MSG_GACHA_INFORMATION_REQ, MSG_GACHA_INFORMATION_SUCCEED_ACK,
+    MSG_PLAYER_DATA_REQ, MSG_PLAYER_DATA_SUCCEED_ACK,
 };
+
+async fn fetch_game_identity(
+    client: &reqwest::Client,
+    region: &Region,
+    session_token: &str,
+    cipher: i32,
+    session_key: &[u8],
+) -> Result<(String, Option<String>)> {
+    let response = with_retry(
+        || {
+            send_game_request(
+                client,
+                region,
+                session_token,
+                cipher,
+                session_key,
+                MSG_PLAYER_DATA_REQ,
+                &[],
+                MSG_PLAYER_DATA_SUCCEED_ACK,
+            )
+        },
+        3,
+        800,
+    )
+    .await?;
+    let info = PlayerInfo::decode(&response[..]).context("decoding player data")?;
+    let acc = info.acc.context("Player data has no account info")?;
+    let game_uid = acc
+        .id
+        .filter(|id| *id > 0)
+        .context("Player data has no game UID")?;
+    let game_name = acc.nickname.filter(|name| !name.is_empty());
+    Ok((game_uid.to_string(), game_name))
+}
 
 async fn fetch_region_history(
     client: &reqwest::Client,
@@ -64,6 +99,13 @@ async fn fetch_region_history(
     }
 
     crypto::reset_http_seq(1);
+
+    let (game_uid, game_name) =
+        fetch_game_identity(client, region, &session_token, ike.cipher, &ike.session_key).await?;
+    match &game_name {
+        Some(name) => println!("Name: {name} (game UID {game_uid})"),
+        None => println!("Game UID {game_uid}"),
+    }
 
     let mut storage_ids: BTreeSet<u32> = catalog.storages.keys().copied().collect();
     for banner in &catalog.banners {
@@ -150,6 +192,8 @@ async fn fetch_region_history(
 
     Ok(FetchedRegion {
         uid: quick.account_uid,
+        game_uid,
+        game_name,
         catalog,
         pulls,
         gacha_info,
@@ -187,30 +231,47 @@ async fn run() -> Result<()> {
     let mut total_pulls = 0u64;
 
     for region in detected {
-        let Some(credentials) = region_credentials(region) else {
-            continue;
+        let accounts = region_credentials(region);
+        let metadata = match load_metadata(&client, region).await {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                eprintln!("{} failed: {error:#}", region.label);
+                continue;
+            }
         };
 
-        let region_result: Result<u64> = async {
-            let metadata = load_metadata(&client, region).await?;
-            let fetched = fetch_region_history(&client, region, credentials, &metadata).await?;
-            let output_file = output_file_for_region(region.key)?;
-            let existing = load_existing_region(&output_file);
-            let region_output =
-                build_region_output(region.key, &fetched, existing.as_ref(), &metadata.item_data)?;
-            write_region_output(&output_file, &region_output)?;
-            println!("{}: {} pulls", region.label, region_output.totals.pulls);
-            println!("Wrote {}", output_file.display());
-            Ok(region_output.totals.pulls)
-        }
-        .await;
+        for credentials in accounts {
+            println!(
+                "Using {} ({}, Yostar UID {})",
+                credentials.file.display(),
+                region.label,
+                credentials.uid
+            );
 
-        match region_result {
-            Ok(pulls) => {
-                success_count += 1;
-                total_pulls += pulls;
+            let region_result: Result<u64> = async {
+                let fetched = fetch_region_history(&client, region, credentials, &metadata).await?;
+                let output_file = output_file_for_account(region.key, &fetched.game_uid)?;
+                let existing = load_existing_region(&output_file);
+                let region_output = build_region_output(
+                    region.key,
+                    &fetched,
+                    existing.as_ref(),
+                    &metadata.item_data,
+                )?;
+                write_region_output(&output_file, &region_output)?;
+                println!("{}: {} pulls", region.label, region_output.totals.pulls);
+                println!("Wrote {}", output_file.display());
+                Ok(region_output.totals.pulls)
             }
-            Err(error) => eprintln!("{} failed: {error:#}", region.label),
+            .await;
+
+            match region_result {
+                Ok(pulls) => {
+                    success_count += 1;
+                    total_pulls += pulls;
+                }
+                Err(error) => eprintln!("{} failed: {error:#}", region.label),
+            }
         }
     }
 

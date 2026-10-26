@@ -182,6 +182,9 @@ pub struct FlatHistoryEntry {
 pub struct RegionOutput {
     pub region: String,
     pub uid: String,
+    pub game_uid: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub game_name: Option<String>,
     pub updated_at: String,
     pub totals: Totals,
     pub storages: Vec<StorageOutput>,

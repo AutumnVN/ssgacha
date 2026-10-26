@@ -137,3 +137,17 @@ pub struct GachaInformationResp {
     #[prost(message, repeated, tag = "1")]
     pub information: Vec<GachaInfo>,
 }
+
+#[derive(Clone, PartialEq, Message)]
+pub struct AccInfo {
+    #[prost(uint64, optional, tag = "1")]
+    pub id: Option<u64>,
+    #[prost(string, optional, tag = "2")]
+    pub nickname: Option<String>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct PlayerInfo {
+    #[prost(message, optional, tag = "1")]
+    pub acc: Option<AccInfo>,
+}

@@ -176,6 +176,15 @@ message GachaInfo {
 message GachaInformationResp {
     repeated GachaInfo Information = 1;
 }
+
+message AccInfo {
+    optional uint64 Id = 1;
+    optional string NickName = 2;
+}
+
+message PlayerInfo {
+    optional AccInfo Acc = 1;
+}
 `;
 
 const root = protobuf.parse(protoText).root;
@@ -187,11 +196,14 @@ const ErrorType = root.lookupType('proto.Error');
 const UI32 = root.lookupType('proto.UI32');
 const GachaHistories = root.lookupType('proto.GachaHistories');
 const GachaInformationResp = root.lookupType('proto.GachaInformationResp');
+const PlayerInfo = root.lookupType('proto.PlayerInfo');
 
 const MSG = {
     loginReq: 4,
     loginSucceedAck: 5,
     loginFailedAck: 6,
+    playerDataReq: 1001,
+    playerDataSucceedAck: 1002,
     gachaInformationReq: 6004,
     gachaInformationSucceedAck: 6005,
     gachaHistoriesReq: 6007,
@@ -282,19 +294,35 @@ function yoSdkRegionFromFile(file) {
     return normalizeRegion(match[1]);
 }
 
+function stringValue(value) {
+    if (value === undefined || value === null) return null;
+    const text = String(value).trim();
+    return text || null;
+}
+
+function compareUids(left, right) {
+    const leftNumber = Number(left);
+    const rightNumber = Number(right);
+    if (Number.isFinite(leftNumber) && Number.isFinite(rightNumber)) {
+        return leftNumber - rightNumber;
+    }
+    return String(left).localeCompare(String(right), undefined, { numeric: true });
+}
+
 function parseYoSdkUserInfo(file) {
     const data = readJsonFile(file);
-    if (!data) return null;
+    if (!data) return [];
 
     const history = parseJsonValue(data.all_user_login_history);
-    if (!Array.isArray(history)) return null;
+    if (!Array.isArray(history)) return [];
 
     const entries = history
         .map(parseJsonValue)
         .filter(Boolean)
-        .sort((a, b) => b.loginTime - a.loginTime);
-    const latest = entries[0];
-    if (!data.ID || !data.Token || !latest || !latest.DeviceID) return null;
+        .sort((a, b) => Number(b.loginTime || 0) - Number(a.loginTime || 0));
+    const currentUid = stringValue(data.ID);
+    const currentToken = stringValue(data.Token);
+    const fallbackDevice = entries.map((entry) => stringValue(entry.DeviceID)).find(Boolean);
 
     let mtime = 0;
     try {
@@ -302,14 +330,27 @@ function parseYoSdkUserInfo(file) {
     } catch (_) {
     }
 
-    return {
-        uid: String(data.ID),
-        token: String(data.Token),
-        device: String(latest.DeviceID),
-        file,
-        region: yoSdkRegionFromFile(file),
-        mtime,
-    };
+    const region = yoSdkRegionFromFile(file);
+    return entries
+        .map((entry) => {
+            const uid = stringValue(entry.ID);
+            if (!uid) return null;
+            const token = stringValue(entry.Token)
+                || (uid === currentUid ? currentToken : null);
+            const device = stringValue(entry.DeviceID) || fallbackDevice;
+            if (!token || !device) return null;
+
+            return {
+                uid,
+                token,
+                device,
+                file,
+                region,
+                mtime,
+                loginTime: Number(entry.loginTime || 0),
+            };
+        })
+        .filter(Boolean);
 }
 
 let _yoSdkCache = null;
@@ -320,27 +361,40 @@ function loadYoSdkCredentials() {
     const files = findYoSdkFiles();
     const users = files
         .filter((file) => /^YoSDK_UserInfo/i.test(path.basename(file)))
-        .map(parseYoSdkUserInfo)
-        .filter(Boolean)
-        .sort((a, b) => b.mtime - a.mtime);
+        .flatMap(parseYoSdkUserInfo)
+        .sort((a, b) => b.mtime - a.mtime || b.loginTime - a.loginTime);
 
     const byRegion = new Map();
     for (const user of users) {
-        if (user.region && !byRegion.has(user.region)) byRegion.set(user.region, user);
+        if (!user.region) continue;
+        if (!byRegion.has(user.region)) byRegion.set(user.region, new Map());
+        const accounts = byRegion.get(user.region);
+        const existing = accounts.get(user.uid);
+        if (!existing) {
+            accounts.set(user.uid, user);
+            continue;
+        }
+        const newer = user.mtime > existing.mtime
+            || (user.mtime === existing.mtime && user.loginTime > existing.loginTime);
+        if (newer) {
+            accounts.set(user.uid, user);
+        }
     }
 
-    _yoSdkCache = byRegion;
+    _yoSdkCache = new Map();
+    for (const [region, accounts] of byRegion) {
+        _yoSdkCache.set(region, [...accounts.values()].sort((a, b) => compareUids(a.uid, b.uid)));
+    }
     return _yoSdkCache;
 }
 
 function findYoSdkCredentials(regionKey) {
-    return loadYoSdkCredentials().get(regionKey);
+    return loadYoSdkCredentials().get(regionKey) || [];
 }
 
-function regionCredentials(region) {
-    const auto = findYoSdkCredentials(region.key);
+function regionCredentials(region, auto) {
     if (!auto) return null;
-    console.log(`Using ${auto.file} (${region.label}, UID ${auto.uid})`);
+    console.log(`Using ${auto.file} (${region.label}, Yostar UID ${auto.uid})`);
     return {
         token: auto.token,
         uid: auto.uid,
@@ -839,6 +893,18 @@ function mergePulls(existingPulls, freshPulls) {
     return merged;
 }
 
+async function fetchGameIdentity(region, sessionToken, cipher, sessionKey) {
+    const respBuf = await withRetry(() => sendGameRequest(
+        region, sessionToken, cipher, sessionKey,
+        MSG.playerDataReq, Buffer.alloc(0), MSG.playerDataSucceedAck,
+    ));
+    const player = PlayerInfo.decode(respBuf);
+    const gameUid = stringValue(player.Acc?.Id);
+    if (!gameUid || gameUid === '0') throw new Error('Player data has no game UID');
+    const gameName = stringValue(player.Acc?.NickName);
+    return { gameUid, gameName };
+}
+
 async function fetchRegionHistory(region, credentials, metadata) {
     const { banners, bannerById, storages } = buildCatalog(metadata);
 
@@ -855,6 +921,13 @@ async function fetchRegionHistory(region, credentials, metadata) {
     if (!sessionToken) throw new Error('Player login returned an empty session token');
 
     _httpSeq = 1;
+
+    const { gameUid, gameName } = await fetchGameIdentity(
+        region, sessionToken, ike.cipher, ike.sessionKey,
+    );
+    console.log(gameName
+        ? `Name: ${gameName} (game UID ${gameUid})`
+        : `Game UID ${gameUid}`);
 
     const storageIds = [...new Set([
         ...storages.keys(),
@@ -902,6 +975,8 @@ async function fetchRegionHistory(region, credentials, metadata) {
 
     return {
         uid: String(accountUid),
+        gameUid,
+        gameName,
         banners,
         bannerById,
         storages,
@@ -963,9 +1038,9 @@ function withSums(target, source) {
 
 function buildRegionOutput(regionKey, fetched, existingRegion, itemData) {
     const { banners, bannerById, storages } = fetched;
+    const existingMatches = Boolean(existingRegion && String(existingRegion.uid) === String(fetched.uid));
 
-    const existingPulls = existingRegion && String(existingRegion.uid) === String(fetched.uid)
-        && Array.isArray(existingRegion.history)
+    const existingPulls = existingMatches && Array.isArray(existingRegion.history)
         ? existingRegion.history.map((entry) => ({
             bannerId: Number(entry.bannerId),
             storageId: Number(entry.storageId),
@@ -1145,6 +1220,8 @@ function buildRegionOutput(regionKey, fetched, existingRegion, itemData) {
     return {
         region: regionKey,
         uid: fetched.uid,
+        gameUid: fetched.gameUid,
+        gameName: fetched.gameName || null,
         updatedAt: new Date().toISOString(),
         totals,
         storages: [...storageStats.values()].sort((a, b) => a.id - b.id),
@@ -1155,12 +1232,16 @@ function buildRegionOutput(regionKey, fetched, existingRegion, itemData) {
     };
 }
 
-function outputFileForRegion(regionKey) {
-    return path.join(__dirname, `gacha.${regionKey}.json`);
+function outputFileForAccount(regionKey, gameUid) {
+    const raw = stringValue(gameUid);
+    if (!raw) throw new Error('Missing game UID');
+    const id = raw.replace(/[^A-Za-z0-9_-]+/g, '_');
+    if (!id) throw new Error('Invalid game UID');
+    return path.join(__dirname, `gacha.${id}.${regionKey}.json`);
 }
 
-function loadExistingRegion(regionKey) {
-    const file = outputFileForRegion(regionKey);
+function loadExistingRegion(regionKey, gameUid) {
+    const file = outputFileForAccount(regionKey, gameUid);
     if (!fs.existsSync(file)) return null;
     try {
         return JSON.parse(fs.readFileSync(file, 'utf8'));
@@ -1204,32 +1285,41 @@ function waitForExit() {
 
     const detectedRegions = REGION_ORDER
         .map((regionKey) => REGIONS[regionKey])
-        .filter((region) => findYoSdkCredentials(region.key));
+        .filter((region) => findYoSdkCredentials(region.key).length > 0);
     const detectedLabels = detectedRegions.map((region) => region.label).join(', ');
     console.log(`Detected ${detectedRegions.length} region${detectedRegions.length === 1 ? '' : 's'}:${detectedLabels ? ` ${detectedLabels}` : ''}`);
 
     for (const region of detectedRegions) {
         const regionKey = region.key;
-        const credentials = regionCredentials(region);
-        if (!credentials) continue;
-
+        let metadata;
         try {
-            const metadata = await loadMetadata(region);
-            const fetched = await fetchRegionHistory(region, credentials, metadata);
-            const regionOutput = buildRegionOutput(
-                regionKey,
-                fetched,
-                loadExistingRegion(regionKey),
-                metadata.itemData,
-            );
-            const outputFile = outputFileForRegion(regionKey);
-            fs.writeFileSync(outputFile, JSON.stringify(regionOutput, null, 4), { encoding: 'utf8' });
-            successCount += 1;
-            totalPulls += regionOutput.totals.pulls;
-            console.log(`${region.label}: ${regionOutput.totals.pulls} pulls`);
-            console.log(`Wrote ${outputFile}`);
+            metadata = await loadMetadata(region);
         } catch (err) {
             console.error(`${region.label} failed: ${err.message}`);
+            continue;
+        }
+
+        for (const auto of findYoSdkCredentials(regionKey)) {
+            const credentials = regionCredentials(region, auto);
+            if (!credentials) continue;
+
+            try {
+                const fetched = await fetchRegionHistory(region, credentials, metadata);
+                const regionOutput = buildRegionOutput(
+                    regionKey,
+                    fetched,
+                    loadExistingRegion(regionKey, fetched.gameUid),
+                    metadata.itemData,
+                );
+                const outputFile = outputFileForAccount(regionKey, fetched.gameUid);
+                fs.writeFileSync(outputFile, JSON.stringify(regionOutput, null, 4), { encoding: 'utf8' });
+                successCount += 1;
+                totalPulls += regionOutput.totals.pulls;
+                console.log(`${region.label}: ${regionOutput.totals.pulls} pulls`);
+                console.log(`Wrote ${outputFile}`);
+            } catch (err) {
+                console.error(`${region.label} failed: ${err.message}`);
+            }
         }
     }
 

@@ -24,6 +24,8 @@ pub struct Pull {
 
 pub struct FetchedRegion {
     pub uid: String,
+    pub game_uid: String,
+    pub game_name: Option<String>,
     pub catalog: Catalog,
     pub pulls: Vec<Pull>,
     pub gacha_info: Vec<GachaInfo>,
@@ -31,6 +33,7 @@ pub struct FetchedRegion {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ExistingRegion {
     #[serde(default)]
     pub uid: Value,
@@ -201,19 +204,21 @@ pub fn build_region_output(
     existing: Option<&ExistingRegion>,
     item_data: &Value,
 ) -> Result<RegionOutput> {
-    let existing_pulls: Vec<Pull> = match existing {
-        Some(existing) if value_string(&existing.uid) == fetched.uid => existing
-            .history
-            .iter()
-            .map(|entry| Pull {
-                banner_id: entry.banner_id,
-                storage_id: entry.storage_id,
-                time: entry.time,
-                ids: entry.ids.clone(),
-            })
-            .collect(),
-        _ => Vec::new(),
-    };
+    let existing_output = existing.filter(|existing| value_string(&existing.uid) == fetched.uid);
+    let existing_pulls: Vec<Pull> = existing_output
+        .map(|existing| {
+            existing
+                .history
+                .iter()
+                .map(|entry| Pull {
+                    banner_id: entry.banner_id,
+                    storage_id: entry.storage_id,
+                    time: entry.time,
+                    ids: entry.ids.clone(),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     let pulls = merge_pulls(&existing_pulls, &fetched.pulls);
 
     let mut all_banners = fetched.catalog.banners.clone();
@@ -464,6 +469,8 @@ pub fn build_region_output(
     Ok(RegionOutput {
         region: region_key.to_string(),
         uid: fetched.uid.clone(),
+        game_uid: fetched.game_uid.clone(),
+        game_name: fetched.game_name.clone(),
         updated_at: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
         totals,
         storages: storage_stats.into_values().collect(),
@@ -474,8 +481,15 @@ pub fn build_region_output(
     })
 }
 
-pub fn output_file_for_region(region_key: &str) -> Result<PathBuf> {
-    Ok(std::env::current_dir()?.join(format!("gacha.{region_key}.json")))
+pub fn output_file_for_account(region_key: &str, game_uid: &str) -> Result<PathBuf> {
+    let id: String = game_uid
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+        .collect();
+    if id.is_empty() {
+        anyhow::bail!("Game UID is empty");
+    }
+    Ok(std::env::current_dir()?.join(format!("gacha.{id}.{region_key}.json")))
 }
 
 pub fn load_existing_region(path: &Path) -> Option<ExistingRegion> {

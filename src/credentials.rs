@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::UNIX_EPOCH;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde_json::Value;
 
 use crate::regions::{normalize_region, Region};
@@ -17,11 +17,12 @@ pub struct Credentials {
     pub file: PathBuf,
     pub region: Option<&'static str>,
     pub mtime: u128,
+    pub login_time: i64,
 }
 
-static YOSDK_CACHE: OnceLock<HashMap<String, Credentials>> = OnceLock::new();
+static YOSDK_CACHE: OnceLock<HashMap<String, Vec<Credentials>>> = OnceLock::new();
 
-pub fn load_yosdk_credentials() -> &'static HashMap<String, Credentials> {
+pub fn load_yosdk_credentials() -> &'static HashMap<String, Vec<Credentials>> {
     YOSDK_CACHE.get_or_init(|| {
         let files = find_yosdk_files();
         let mut users: Vec<Credentials> = files
@@ -32,33 +33,53 @@ pub fn load_yosdk_credentials() -> &'static HashMap<String, Credentials> {
                     .map(|name| name.to_lowercase().starts_with("yosdk_userinfo"))
                     .unwrap_or(false)
             })
-            .filter_map(|file| parse_yosdk_user_info(file).ok().flatten())
+            .flat_map(|file| parse_yosdk_user_info(file).unwrap_or_default())
             .collect();
-        users.sort_by(|a, b| b.mtime.cmp(&a.mtime));
 
-        let mut by_region = HashMap::new();
+        users.sort_by(|a, b| {
+            b.mtime
+                .cmp(&a.mtime)
+                .then_with(|| b.login_time.cmp(&a.login_time))
+        });
+
+        let mut by_region: HashMap<String, Vec<Credentials>> = HashMap::new();
         for user in users {
-            if let Some(region) = user.region {
-                by_region.entry(region.to_string()).or_insert(user);
+            let Some(region) = user.region else {
+                continue;
+            };
+            let entries = by_region.entry(region.to_string()).or_default();
+            if let Some(existing) = entries.iter_mut().find(|entry| entry.uid == user.uid) {
+                let newer = user.mtime > existing.mtime
+                    || (user.mtime == existing.mtime && user.login_time > existing.login_time);
+                if newer {
+                    *existing = user;
+                }
+            } else {
+                entries.push(user);
             }
         }
+
+        for entries in by_region.values_mut() {
+            entries.sort_by(|a, b| compare_uids(&a.uid, &b.uid));
+        }
+
         by_region
     })
 }
 
-pub fn find_yosdk_credentials(region_key: &str) -> Option<&'static Credentials> {
-    load_yosdk_credentials().get(region_key)
+pub fn find_yosdk_credentials(region_key: &str) -> Option<&'static [Credentials]> {
+    load_yosdk_credentials().get(region_key).map(Vec::as_slice)
 }
 
-pub fn region_credentials(region: &Region) -> Option<&'static Credentials> {
-    let credentials = find_yosdk_credentials(region.key)?;
-    println!(
-        "Using {} ({}, UID {})",
-        credentials.file.display(),
-        region.label,
-        credentials.uid
-    );
-    Some(credentials)
+pub fn region_credentials(region: &Region) -> &'static [Credentials] {
+    find_yosdk_credentials(region.key).unwrap_or(&[])
+}
+
+fn compare_uids(left: &str, right: &str) -> std::cmp::Ordering {
+    match (left.parse::<u128>(), right.parse::<u128>()) {
+        (Ok(left), Ok(right)) => left.cmp(&right),
+        _ => left.cmp(right),
+    }
 }
 
 fn stella_sora_directories() -> Vec<PathBuf> {
@@ -132,7 +153,11 @@ fn js_string(value: &Value) -> Option<String> {
     }
 }
 
-fn login_time(value: &Value) -> i64 {
+fn non_empty(value: Option<String>) -> Option<String> {
+    value.filter(|text| !text.is_empty())
+}
+
+fn to_i64(value: &Value) -> i64 {
     if let Some(number) = value.as_i64() {
         return number;
     }
@@ -143,6 +168,10 @@ fn login_time(value: &Value) -> i64 {
         return text.parse::<i64>().unwrap_or(0);
     }
     0
+}
+
+fn login_time(entry: &Value) -> i64 {
+    entry.get("loginTime").map(to_i64).unwrap_or(0)
 }
 
 fn yosdk_region_from_file(file: &Path) -> Option<&'static str> {
@@ -158,18 +187,18 @@ fn yosdk_region_from_file(file: &Path) -> Option<&'static str> {
     normalize_region(region)
 }
 
-fn parse_yosdk_user_info(file: &Path) -> Result<Option<Credentials>> {
+fn parse_yosdk_user_info(file: &Path) -> Result<Vec<Credentials>> {
     let Some(data) = read_json_file(file)? else {
-        return Ok(None);
+        return Ok(Vec::new());
     };
     let Some(history_value) = data.get("all_user_login_history") else {
-        return Ok(None);
+        return Ok(Vec::new());
     };
     let Some(history) = parse_json_value(history_value) else {
-        return Ok(None);
+        return Ok(Vec::new());
     };
     let Some(history) = history.as_array() else {
-        return Ok(None);
+        return Ok(Vec::new());
     };
 
     let mut entries: Vec<Value> = history.iter().filter_map(parse_json_value).collect();
@@ -179,31 +208,11 @@ fn parse_yosdk_user_info(file: &Path) -> Result<Option<Credentials>> {
             .unwrap_or(std::cmp::Ordering::Equal)
     });
 
-    let latest = entries.first();
-    let Some(latest) = latest else {
-        return Ok(None);
-    };
-    let Some(device) = latest
-        .get("DeviceID")
-        .and_then(Value::as_str)
-        .filter(|device| !device.is_empty())
-    else {
-        return Ok(None);
-    };
-    let Some(uid) = data
-        .get("ID")
-        .and_then(js_string)
-        .filter(|uid| !uid.is_empty())
-    else {
-        return Ok(None);
-    };
-    let Some(token) = data
-        .get("Token")
-        .and_then(js_string)
-        .filter(|token| !token.is_empty())
-    else {
-        return Ok(None);
-    };
+    let current_uid = non_empty(data.get("ID").and_then(js_string));
+    let current_token = non_empty(data.get("Token").and_then(js_string));
+    let fallback_device = entries
+        .iter()
+        .find_map(|entry| non_empty(entry.get("DeviceID").and_then(js_string)));
 
     let mtime = fs::metadata(file)
         .ok()
@@ -212,17 +221,38 @@ fn parse_yosdk_user_info(file: &Path) -> Result<Option<Credentials>> {
         .map(|duration| duration.as_millis())
         .unwrap_or(0);
 
-    Ok(Some(Credentials {
-        uid,
-        token,
-        device: device.to_string(),
-        file: file.to_path_buf(),
-        region: yosdk_region_from_file(file),
-        mtime,
-    }))
-}
+    let region = yosdk_region_from_file(file);
+    let mut users = Vec::new();
+    for entry in entries {
+        let Some(uid) = non_empty(entry.get("ID").and_then(js_string)) else {
+            continue;
+        };
+        let token = non_empty(entry.get("Token").and_then(js_string)).or_else(|| {
+            if current_uid.as_deref() == Some(uid.as_str()) {
+                current_token.clone()
+            } else {
+                None
+            }
+        });
+        let Some(token) = token else {
+            continue;
+        };
+        let device = non_empty(entry.get("DeviceID").and_then(js_string))
+            .or_else(|| fallback_device.clone());
+        let Some(device) = device else {
+            continue;
+        };
 
-#[allow(dead_code)]
-pub fn read_credentials_for_test(file: &Path) -> Result<Option<Credentials>> {
-    parse_yosdk_user_info(file).with_context(|| format!("reading {}", file.display()))
+        users.push(Credentials {
+            uid,
+            token,
+            device,
+            file: file.to_path_buf(),
+            region,
+            mtime,
+            login_time: login_time(&entry),
+        });
+    }
+
+    Ok(users)
 }
