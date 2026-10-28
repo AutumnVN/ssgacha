@@ -8,7 +8,7 @@ const REGION_ORDER = ['en', 'jp', 'kr', 'tw', 'cn'];
 
 const CLIENT_VERSION = '727.727.727.7272727';
 const SDK_VERSION = '4.16.0';
-const SDK_VERSION_CN = '1.16.0';
+const SDK_VERSION_CN = '1.20.0';
 const DEVICE_MODEL = 'AutumnVN';
 const SPARK_THRESHOLD = 120;
 
@@ -59,7 +59,7 @@ const REGIONS = {
         serverUrl: 'https://nova.stargazer-games.com',
         garbleKey: Buffer.from('N&mfco452ZH5!nE3s&o5uxB57UGPENVo', 'ascii'),
         language: 'zh_TW',
-        authLang: 'zh-TW',
+        authLang: 'zh-Hant',
         pid: 'TW-NOVA',
         dataPath: 'TW',
         sdkVersion: SDK_VERSION,
@@ -239,7 +239,7 @@ function stellaSoraDirectories() {
     }
 
     return entries
-        .filter((entry) => entry.isDirectory() && /yostar/i.test(entry.name))
+        .filter((entry) => entry.isDirectory())
         .map((entry) => path.join(localLow, entry.name, 'StellaSora'))
         .filter((dir) => fs.existsSync(dir));
 }
@@ -254,12 +254,41 @@ function findYoSdkFiles() {
             continue;
         }
         for (const entry of entries) {
-            if (entry.isFile() && /^YoSDK_/i.test(entry.name)) {
+            if (entry.isFile() && /^YoSDK_UserInfo/i.test(entry.name)) {
                 files.push(path.join(dir, entry.name));
             }
         }
     }
+
+    const localLow = path.join(os.homedir(), 'AppData', 'LocalLow');
+    let companies;
+    try {
+        companies = fs.readdirSync(localLow, { withFileTypes: true });
+    } catch (_) {
+        return files;
+    }
+    for (const company of companies) {
+        if (!company.isDirectory()) continue;
+        const cn = path.join(
+            localLow,
+            company.name,
+            'xtlr',
+            'CN_SDK_Cache',
+            'official',
+            'sdk_cn_official_userinfo',
+        );
+        try {
+            if (fs.statSync(cn).isFile()) files.push(cn);
+        } catch (_) {
+        }
+    }
+
     return files;
+}
+
+function isCredentialFile(file) {
+    const name = path.basename(file).toLowerCase();
+    return name.startsWith('yosdk_userinfo') || name === 'sdk_cn_official_userinfo';
 }
 
 function readJsonFile(file) {
@@ -289,6 +318,7 @@ function normalizeRegion(value) {
 
 function yoSdkRegionFromFile(file) {
     const name = path.basename(file);
+    if (name.toLowerCase() === 'sdk_cn_official_userinfo') return 'cn';
     const match = /^YoSDK_UserInfo(?:[_-](.+))?$/i.exec(name);
     if (!match || !match[1]) return null;
     return normalizeRegion(match[1]);
@@ -313,17 +343,6 @@ function parseYoSdkUserInfo(file) {
     const data = readJsonFile(file);
     if (!data) return [];
 
-    const history = parseJsonValue(data.all_user_login_history);
-    if (!Array.isArray(history)) return [];
-
-    const entries = history
-        .map(parseJsonValue)
-        .filter(Boolean)
-        .sort((a, b) => Number(b.loginTime || 0) - Number(a.loginTime || 0));
-    const currentUid = stringValue(data.ID);
-    const currentToken = stringValue(data.Token);
-    const fallbackDevice = entries.map((entry) => stringValue(entry.DeviceID)).find(Boolean);
-
     let mtime = 0;
     try {
         mtime = fs.statSync(file).mtimeMs;
@@ -331,16 +350,27 @@ function parseYoSdkUserInfo(file) {
     }
 
     const region = yoSdkRegionFromFile(file);
-    return entries
-        .map((entry) => {
+    const users = [];
+
+    const history = parseJsonValue(data.all_user_login_history);
+    if (Array.isArray(history)) {
+        const entries = history
+            .map(parseJsonValue)
+            .filter(Boolean)
+            .sort((a, b) => Number(b.loginTime || 0) - Number(a.loginTime || 0));
+        const currentUid = stringValue(data.ID);
+        const currentToken = stringValue(data.Token);
+        const fallbackDevice = entries.map((entry) => stringValue(entry.DeviceID)).find(Boolean);
+
+        for (const entry of entries) {
             const uid = stringValue(entry.ID);
-            if (!uid) return null;
+            if (!uid) continue;
             const token = stringValue(entry.Token)
                 || (uid === currentUid ? currentToken : null);
             const device = stringValue(entry.DeviceID) || fallbackDevice;
-            if (!token || !device) return null;
+            if (!token || !device) continue;
 
-            return {
+            users.push({
                 uid,
                 token,
                 device,
@@ -348,9 +378,30 @@ function parseYoSdkUserInfo(file) {
                 region,
                 mtime,
                 loginTime: Number(entry.loginTime || 0),
-            };
-        })
-        .filter(Boolean);
+            });
+        }
+    }
+
+    const userInfo = parseJsonValue(data.UserInfo);
+    if (userInfo && typeof userInfo === 'object' && !Array.isArray(userInfo)) {
+        const uid = stringValue(userInfo.ID) || stringValue(userInfo.PassId);
+        const token = stringValue(userInfo.Token);
+        const device = stringValue(userInfo.DeviceID);
+
+        if (uid && token && device) {
+            users.push({
+                uid,
+                token,
+                device,
+                file,
+                region,
+                mtime,
+                loginTime: 0,
+            });
+        }
+    }
+
+    return users;
 }
 
 let _yoSdkCache = null;
@@ -360,7 +411,7 @@ function loadYoSdkCredentials() {
 
     const files = findYoSdkFiles();
     const users = files
-        .filter((file) => /^YoSDK_UserInfo/i.test(path.basename(file)))
+        .filter(isCredentialFile)
         .flatMap(parseYoSdkUserInfo)
         .sort((a, b) => b.mtime - a.mtime || b.loginTime - a.loginTime);
 

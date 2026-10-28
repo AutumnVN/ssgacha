@@ -30,7 +30,10 @@ pub fn load_yosdk_credentials() -> &'static HashMap<String, Vec<Credentials>> {
             .filter(|file| {
                 file.file_name()
                     .and_then(|name| name.to_str())
-                    .map(|name| name.to_lowercase().starts_with("yosdk_userinfo"))
+                    .map(|name| {
+                        let n = name.to_ascii_lowercase();
+                        n.starts_with("yosdk_userinfo") || n == "sdk_cn_official_userinfo"
+                    })
                     .unwrap_or(false)
             })
             .flat_map(|file| parse_yosdk_user_info(file).unwrap_or_default())
@@ -93,16 +96,9 @@ fn stella_sora_directories() -> Vec<PathBuf> {
 
     entries
         .filter_map(Result::ok)
-        .filter(|entry| {
-            entry
-                .file_name()
-                .to_str()
-                .map(|name| name.to_ascii_lowercase().contains("yostar"))
-                .unwrap_or(false)
-                && entry.path().is_dir()
-        })
+        .filter(|entry| entry.path().is_dir())
         .map(|entry| entry.path().join("StellaSora"))
-        .filter(|dir| dir.exists())
+        .filter(|dir| dir.is_dir())
         .collect()
 }
 
@@ -117,13 +113,34 @@ fn find_yosdk_files() -> Vec<PathBuf> {
                 && entry
                     .file_name()
                     .to_str()
-                    .map(|name| name.to_ascii_lowercase().starts_with("yosdk_"))
+                    .map(|name| name.to_ascii_lowercase().starts_with("yosdk_userinfo"))
                     .unwrap_or(false)
             {
                 files.push(entry.path());
             }
         }
     }
+
+    if let Some(home) = dirs::home_dir() {
+        let local_low = home.join("AppData").join("LocalLow");
+        if let Ok(entries) = fs::read_dir(&local_low) {
+            for company in entries.filter_map(Result::ok) {
+                if !company.path().is_dir() {
+                    continue;
+                }
+                let cn = company
+                    .path()
+                    .join("xtlr")
+                    .join("CN_SDK_Cache")
+                    .join("official")
+                    .join("sdk_cn_official_userinfo");
+                if cn.is_file() {
+                    files.push(cn);
+                }
+            }
+        }
+    }
+
     files
 }
 
@@ -176,10 +193,15 @@ fn login_time(entry: &Value) -> i64 {
 
 fn yosdk_region_from_file(file: &Path) -> Option<&'static str> {
     let name = file.file_name()?.to_str()?;
-    if !name.to_ascii_lowercase().starts_with("yosdk_userinfo") {
+    let lower = name.to_ascii_lowercase();
+
+    if lower == "sdk_cn_official_userinfo" {
+        return Some("cn");
+    }
+    if !lower.starts_with("yosdk_userinfo") {
         return None;
     }
-    let rest = &name["YoSDK_UserInfo".len()..];
+    let rest = name.get("YoSDK_UserInfo".len()..)?;
     let region = rest.trim_start_matches(['_', '-']);
     if region.is_empty() {
         return None;
@@ -191,28 +213,6 @@ fn parse_yosdk_user_info(file: &Path) -> Result<Vec<Credentials>> {
     let Some(data) = read_json_file(file)? else {
         return Ok(Vec::new());
     };
-    let Some(history_value) = data.get("all_user_login_history") else {
-        return Ok(Vec::new());
-    };
-    let Some(history) = parse_json_value(history_value) else {
-        return Ok(Vec::new());
-    };
-    let Some(history) = history.as_array() else {
-        return Ok(Vec::new());
-    };
-
-    let mut entries: Vec<Value> = history.iter().filter_map(parse_json_value).collect();
-    entries.sort_by(|a, b| {
-        login_time(b)
-            .partial_cmp(&login_time(a))
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-
-    let current_uid = non_empty(data.get("ID").and_then(js_string));
-    let current_token = non_empty(data.get("Token").and_then(js_string));
-    let fallback_device = entries
-        .iter()
-        .find_map(|entry| non_empty(entry.get("DeviceID").and_then(js_string)));
 
     let mtime = fs::metadata(file)
         .ok()
@@ -223,35 +223,70 @@ fn parse_yosdk_user_info(file: &Path) -> Result<Vec<Credentials>> {
 
     let region = yosdk_region_from_file(file);
     let mut users = Vec::new();
-    for entry in entries {
-        let Some(uid) = non_empty(entry.get("ID").and_then(js_string)) else {
-            continue;
-        };
-        let token = non_empty(entry.get("Token").and_then(js_string)).or_else(|| {
-            if current_uid.as_deref() == Some(uid.as_str()) {
-                current_token.clone()
-            } else {
-                None
-            }
-        });
-        let Some(token) = token else {
-            continue;
-        };
-        let device = non_empty(entry.get("DeviceID").and_then(js_string))
-            .or_else(|| fallback_device.clone());
-        let Some(device) = device else {
-            continue;
-        };
 
-        users.push(Credentials {
-            uid,
-            token,
-            device,
-            file: file.to_path_buf(),
-            region,
-            mtime,
-            login_time: login_time(&entry),
-        });
+    if let Some(history_value) = data.get("all_user_login_history") {
+        if let Some(history) = parse_json_value(history_value) {
+            if let Some(history) = history.as_array() {
+                let mut entries: Vec<Value> = history.iter().filter_map(parse_json_value).collect();
+                entries.sort_by(|a, b| {
+                    login_time(b)
+                        .partial_cmp(&login_time(a))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+
+                let current_uid = non_empty(data.get("ID").and_then(js_string));
+                let current_token = non_empty(data.get("Token").and_then(js_string));
+                let fallback_device = entries
+                    .iter()
+                    .find_map(|entry| non_empty(entry.get("DeviceID").and_then(js_string)));
+
+                for entry in entries {
+                    let Some(uid) = non_empty(entry.get("ID").and_then(js_string)) else {
+                        continue;
+                    };
+                    let token = non_empty(entry.get("Token").and_then(js_string)).or_else(|| {
+                        if current_uid.as_deref() == Some(uid.as_str()) {
+                            current_token.clone()
+                        } else {
+                            None
+                        }
+                    });
+                    let Some(token) = token else { continue };
+                    let device = non_empty(entry.get("DeviceID").and_then(js_string))
+                        .or_else(|| fallback_device.clone());
+                    let Some(device) = device else { continue };
+
+                    users.push(Credentials {
+                        uid,
+                        token,
+                        device,
+                        file: file.to_path_buf(),
+                        region,
+                        mtime,
+                        login_time: login_time(&entry),
+                    });
+                }
+            }
+        }
+    }
+
+    if let Some(user_info) = data.get("UserInfo").and_then(parse_json_value) {
+        let uid = non_empty(user_info.get("ID").and_then(js_string))
+            .or_else(|| non_empty(user_info.get("PassId").and_then(js_string)));
+        let token = non_empty(user_info.get("Token").and_then(js_string));
+        let device = non_empty(user_info.get("DeviceID").and_then(js_string));
+
+        if let (Some(uid), Some(token), Some(device)) = (uid, token, device) {
+            users.push(Credentials {
+                uid,
+                token,
+                device,
+                file: file.to_path_buf(),
+                region,
+                mtime,
+                login_time: 0,
+            });
+        }
     }
 
     Ok(users)
