@@ -209,7 +209,11 @@ async fn run() -> Result<()> {
     let detected: Vec<&Region> = REGION_ORDER
         .iter()
         .filter_map(|key| region_by_key(key))
-        .filter(|region| find_yosdk_credentials(region.key).is_some())
+        .filter(|region| {
+            find_yosdk_credentials(region.key)
+                .map(|credentials| !credentials.is_empty())
+                .unwrap_or(false)
+        })
         .collect();
     let labels = detected
         .iter()
@@ -226,6 +230,9 @@ async fn run() -> Result<()> {
             format!(" {labels}")
         }
     );
+    if detected.is_empty() {
+        eprintln!("No credentials detected.");
+    }
 
     let mut success_count = 0usize;
     let mut total_pulls = 0u64;
@@ -239,6 +246,11 @@ async fn run() -> Result<()> {
                 continue;
             }
         };
+
+        if accounts.is_empty() {
+            eprintln!("{}: no accounts to fetch", region.label);
+            continue;
+        }
 
         for credentials in accounts {
             println!(

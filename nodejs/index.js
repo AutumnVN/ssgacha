@@ -231,17 +231,29 @@ const REGION_ALIASES = {
 
 function stellaSoraDirectories() {
     const localLow = path.join(os.homedir(), 'AppData', 'LocalLow');
+    const dirs = [];
     let entries;
     try {
         entries = fs.readdirSync(localLow, { withFileTypes: true });
-    } catch (_) {
+    } catch (err) {
+        if (err.code !== 'ENOENT') {
+            console.error(`Could not read ${localLow}: ${err.message}`);
+        }
         return [];
     }
 
-    return entries
-        .filter((entry) => entry.isDirectory())
-        .map((entry) => path.join(localLow, entry.name, 'StellaSora'))
-        .filter((dir) => fs.existsSync(dir));
+    for (const entry of entries) {
+        const stella = path.join(localLow, entry.name, 'StellaSora');
+        try {
+            if (fs.statSync(stella).isDirectory()) dirs.push(stella);
+        } catch (err) {
+            if (err.code !== 'ENOENT') {
+                console.error(`Could not access ${stella}: ${err.message}`);
+            }
+        }
+    }
+
+    return [...new Set(dirs)];
 }
 
 function findYoSdkFiles() {
@@ -250,13 +262,19 @@ function findYoSdkFiles() {
         let entries;
         try {
             entries = fs.readdirSync(dir, { withFileTypes: true });
-        } catch (_) {
+        } catch (err) {
+            console.error(`Could not read ${dir}: ${err.message}`);
             continue;
         }
+        let found = false;
         for (const entry of entries) {
             if (entry.isFile() && /^YoSDK_UserInfo/i.test(entry.name)) {
                 files.push(path.join(dir, entry.name));
+                found = true;
             }
+        }
+        if (!found) {
+            console.error(`No YoSDK_UserInfo* files in ${dir}`);
         }
     }
 
@@ -268,10 +286,17 @@ function findYoSdkFiles() {
         return files;
     }
     for (const company of companies) {
-        if (!company.isDirectory()) continue;
+        const companyPath = path.join(localLow, company.name);
+        let companyStat;
+        try {
+            companyStat = fs.statSync(companyPath);
+        } catch (_) {
+            continue;
+        }
+        if (!companyStat.isDirectory()) continue;
+
         const cn = path.join(
-            localLow,
-            company.name,
+            companyPath,
             'xtlr',
             'CN_SDK_Cache',
             'official',
@@ -341,7 +366,10 @@ function compareUids(left, right) {
 
 function parseYoSdkUserInfo(file) {
     const data = readJsonFile(file);
-    if (!data) return [];
+    if (!data) {
+        console.error(`${file}: empty or invalid JSON`);
+        return [];
+    }
 
     let mtime = 0;
     try {
@@ -351,8 +379,12 @@ function parseYoSdkUserInfo(file) {
 
     const region = yoSdkRegionFromFile(file);
     const users = [];
+    let skippedMissingUid = 0;
+    let skippedMissingToken = 0;
+    let skippedMissingDevice = 0;
 
-    const history = parseJsonValue(data.all_user_login_history);
+    const historyValue = data.all_user_login_history;
+    const history = parseJsonValue(historyValue);
     if (Array.isArray(history)) {
         const entries = history
             .map(parseJsonValue)
@@ -364,11 +396,21 @@ function parseYoSdkUserInfo(file) {
 
         for (const entry of entries) {
             const uid = stringValue(entry.ID);
-            if (!uid) continue;
+            if (!uid) {
+                skippedMissingUid += 1;
+                continue;
+            }
             const token = stringValue(entry.Token)
                 || (uid === currentUid ? currentToken : null);
+            if (!token) {
+                skippedMissingToken += 1;
+                continue;
+            }
             const device = stringValue(entry.DeviceID) || fallbackDevice;
-            if (!token || !device) continue;
+            if (!device) {
+                skippedMissingDevice += 1;
+                continue;
+            }
 
             users.push({
                 uid,
@@ -380,13 +422,20 @@ function parseYoSdkUserInfo(file) {
                 loginTime: Number(entry.loginTime || 0),
             });
         }
+    } else if (historyValue !== undefined) {
+        console.error(`${file}: all_user_login_history is not a valid array`);
     }
 
-    const userInfo = parseJsonValue(data.UserInfo);
+    const userInfoValue = data.UserInfo;
+    const userInfo = parseJsonValue(userInfoValue);
     if (userInfo && typeof userInfo === 'object' && !Array.isArray(userInfo)) {
         const uid = stringValue(userInfo.ID) || stringValue(userInfo.PassId);
         const token = stringValue(userInfo.Token);
         const device = stringValue(userInfo.DeviceID);
+        const missing = [];
+        if (!uid) missing.push('UID');
+        if (!token) missing.push('Token');
+        if (!device) missing.push('DeviceID');
 
         if (uid && token && device) {
             users.push({
@@ -398,7 +447,20 @@ function parseYoSdkUserInfo(file) {
                 mtime,
                 loginTime: 0,
             });
+        } else {
+            console.error(`${file}: UserInfo skipped (missing ${missing.join(', ')})`);
         }
+    } else if (userInfoValue !== undefined) {
+        console.error(`${file}: invalid UserInfo JSON`);
+    }
+
+    if (skippedMissingUid + skippedMissingToken + skippedMissingDevice > 0) {
+        console.error(`${file}: skipped login history entries (missing UID=${skippedMissingUid}, token=${skippedMissingToken}, DeviceID=${skippedMissingDevice})`);
+    }
+
+    if (users.length === 0) {
+        const keys = Object.keys(data);
+        console.error(`${file}: no usable account (top-level keys: ${keys.length ? keys.join(', ') : 'none'})`);
     }
 
     return users;
@@ -410,14 +472,24 @@ function loadYoSdkCredentials() {
     if (_yoSdkCache) return _yoSdkCache;
 
     const files = findYoSdkFiles();
-    const users = files
-        .filter(isCredentialFile)
-        .flatMap(parseYoSdkUserInfo)
-        .sort((a, b) => b.mtime - a.mtime || b.loginTime - a.loginTime);
+    const users = [];
+    for (const file of files) {
+        if (!isCredentialFile(file)) {
+            console.error(`Skipping ${file} (not a credential file)`);
+            continue;
+        }
+
+        const parsed = parseYoSdkUserInfo(file);
+        users.push(...parsed);
+    }
+    users.sort((a, b) => b.mtime - a.mtime || b.loginTime - a.loginTime);
 
     const byRegion = new Map();
     for (const user of users) {
-        if (!user.region) continue;
+        if (!user.region) {
+            console.error(`Skipping ${user.file}: could not determine region from filename`);
+            continue;
+        }
         if (!byRegion.has(user.region)) byRegion.set(user.region, new Map());
         const accounts = byRegion.get(user.region);
         const existing = accounts.get(user.uid);
@@ -432,6 +504,9 @@ function loadYoSdkCredentials() {
         }
     }
 
+    if (byRegion.size === 0) {
+        console.error('No regions detected from credential files');
+    }
     _yoSdkCache = new Map();
     for (const [region, accounts] of byRegion) {
         _yoSdkCache.set(region, [...accounts.values()].sort((a, b) => compareUids(a.uid, b.uid)));
@@ -1316,16 +1391,16 @@ function waitForExit() {
             stdin.setRawMode(true);
             rawMode = true;
         }
-    } catch {}
+    } catch { }
 
     try {
         fs.readSync(0, Buffer.alloc(1), 0, 1, null);
-    } catch {}
+    } catch { }
 
     if (rawMode) {
         try {
             stdin.setRawMode(false);
-        } catch {}
+        } catch { }
     }
     process.stdout.write('\n');
 }
@@ -1339,9 +1414,13 @@ function waitForExit() {
         .filter((region) => findYoSdkCredentials(region.key).length > 0);
     const detectedLabels = detectedRegions.map((region) => region.label).join(', ');
     console.log(`Detected ${detectedRegions.length} region${detectedRegions.length === 1 ? '' : 's'}:${detectedLabels ? ` ${detectedLabels}` : ''}`);
+    if (detectedRegions.length === 0) {
+        console.error('No credentials detected.');
+    }
 
     for (const region of detectedRegions) {
         const regionKey = region.key;
+        const accounts = findYoSdkCredentials(regionKey);
         let metadata;
         try {
             metadata = await loadMetadata(region);
@@ -1350,7 +1429,7 @@ function waitForExit() {
             continue;
         }
 
-        for (const auto of findYoSdkCredentials(regionKey)) {
+        for (const auto of accounts) {
             const credentials = regionCredentials(region, auto);
             if (!credentials) continue;
 

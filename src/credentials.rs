@@ -25,19 +25,18 @@ static YOSDK_CACHE: OnceLock<HashMap<String, Vec<Credentials>>> = OnceLock::new(
 pub fn load_yosdk_credentials() -> &'static HashMap<String, Vec<Credentials>> {
     YOSDK_CACHE.get_or_init(|| {
         let files = find_yosdk_files();
-        let mut users: Vec<Credentials> = files
-            .iter()
-            .filter(|file| {
-                file.file_name()
-                    .and_then(|name| name.to_str())
-                    .map(|name| {
-                        let n = name.to_ascii_lowercase();
-                        n.starts_with("yosdk_userinfo") || n == "sdk_cn_official_userinfo"
-                    })
-                    .unwrap_or(false)
-            })
-            .flat_map(|file| parse_yosdk_user_info(file).unwrap_or_default())
-            .collect();
+        let mut users = Vec::new();
+        for file in &files {
+            if !is_credential_file(file) {
+                eprintln!("Skipping {} (not a credential file)", file.display());
+                continue;
+            }
+
+            match parse_yosdk_user_info(file) {
+                Ok(parsed) => users.extend(parsed),
+                Err(error) => eprintln!("{}: parse error: {error:#}", file.display()),
+            }
+        }
 
         users.sort_by(|a, b| {
             b.mtime
@@ -48,6 +47,10 @@ pub fn load_yosdk_credentials() -> &'static HashMap<String, Vec<Credentials>> {
         let mut by_region: HashMap<String, Vec<Credentials>> = HashMap::new();
         for user in users {
             let Some(region) = user.region else {
+                eprintln!(
+                    "Skipping {}: could not determine region from filename",
+                    user.file.display()
+                );
                 continue;
             };
             let entries = by_region.entry(region.to_string()).or_default();
@@ -62,12 +65,25 @@ pub fn load_yosdk_credentials() -> &'static HashMap<String, Vec<Credentials>> {
             }
         }
 
+        if by_region.is_empty() {
+            eprintln!("No regions detected from credential files");
+        }
         for entries in by_region.values_mut() {
             entries.sort_by(|a, b| compare_uids(&a.uid, &b.uid));
         }
 
         by_region
     })
+}
+
+fn is_credential_file(file: &Path) -> bool {
+    file.file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| {
+            let n = name.to_ascii_lowercase();
+            n.starts_with("yosdk_userinfo") || n == "sdk_cn_official_userinfo"
+        })
+        .unwrap_or(false)
 }
 
 pub fn find_yosdk_credentials(region_key: &str) -> Option<&'static [Credentials]> {
@@ -87,27 +103,47 @@ fn compare_uids(left: &str, right: &str) -> std::cmp::Ordering {
 
 fn stella_sora_directories() -> Vec<PathBuf> {
     let Some(home) = dirs::home_dir() else {
+        eprintln!("Could not determine home directory");
         return Vec::new();
     };
     let local_low = home.join("AppData").join("LocalLow");
-    let Ok(entries) = fs::read_dir(&local_low) else {
-        return Vec::new();
+    let entries = match fs::read_dir(&local_low) {
+        Ok(entries) => entries,
+        Err(error) => {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                eprintln!("Could not read {}: {error}", local_low.display());
+            }
+            return Vec::new();
+        }
     };
 
-    entries
-        .filter_map(Result::ok)
-        .filter(|entry| entry.path().is_dir())
-        .map(|entry| entry.path().join("StellaSora"))
-        .filter(|dir| dir.is_dir())
-        .collect()
+    let mut dirs = Vec::new();
+    for entry in entries.filter_map(Result::ok) {
+        let stella = entry.path().join("StellaSora");
+        match fs::metadata(&stella) {
+            Ok(metadata) if metadata.is_dir() => dirs.push(stella),
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => eprintln!("Could not access {}: {error}", stella.display()),
+        }
+    }
+
+    dirs.sort();
+    dirs.dedup();
+    dirs
 }
 
 fn find_yosdk_files() -> Vec<PathBuf> {
     let mut files = Vec::new();
     for dir in stella_sora_directories() {
-        let Ok(entries) = fs::read_dir(dir) else {
-            continue;
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(error) => {
+                eprintln!("Could not read {}: {error}", dir.display());
+                continue;
+            }
         };
+        let mut found = false;
         for entry in entries.filter_map(Result::ok) {
             if entry.path().is_file()
                 && entry
@@ -117,7 +153,11 @@ fn find_yosdk_files() -> Vec<PathBuf> {
                     .unwrap_or(false)
             {
                 files.push(entry.path());
+                found = true;
             }
+        }
+        if !found {
+            eprintln!("No YoSDK_UserInfo* files in {}", dir.display());
         }
     }
 
@@ -211,6 +251,7 @@ fn yosdk_region_from_file(file: &Path) -> Option<&'static str> {
 
 fn parse_yosdk_user_info(file: &Path) -> Result<Vec<Credentials>> {
     let Some(data) = read_json_file(file)? else {
+        eprintln!("{}: empty or invalid JSON", file.display());
         return Ok(Vec::new());
     };
 
@@ -223,6 +264,9 @@ fn parse_yosdk_user_info(file: &Path) -> Result<Vec<Credentials>> {
 
     let region = yosdk_region_from_file(file);
     let mut users = Vec::new();
+    let mut skipped_missing_uid = 0usize;
+    let mut skipped_missing_token = 0usize;
+    let mut skipped_missing_device = 0usize;
 
     if let Some(history_value) = data.get("all_user_login_history") {
         if let Some(history) = parse_json_value(history_value) {
@@ -242,6 +286,7 @@ fn parse_yosdk_user_info(file: &Path) -> Result<Vec<Credentials>> {
 
                 for entry in entries {
                     let Some(uid) = non_empty(entry.get("ID").and_then(js_string)) else {
+                        skipped_missing_uid += 1;
                         continue;
                     };
                     let token = non_empty(entry.get("Token").and_then(js_string)).or_else(|| {
@@ -251,10 +296,16 @@ fn parse_yosdk_user_info(file: &Path) -> Result<Vec<Credentials>> {
                             None
                         }
                     });
-                    let Some(token) = token else { continue };
+                    let Some(token) = token else {
+                        skipped_missing_token += 1;
+                        continue;
+                    };
                     let device = non_empty(entry.get("DeviceID").and_then(js_string))
                         .or_else(|| fallback_device.clone());
-                    let Some(device) = device else { continue };
+                    let Some(device) = device else {
+                        skipped_missing_device += 1;
+                        continue;
+                    };
 
                     users.push(Credentials {
                         uid,
@@ -266,15 +317,40 @@ fn parse_yosdk_user_info(file: &Path) -> Result<Vec<Credentials>> {
                         login_time: login_time(&entry),
                     });
                 }
+            } else {
+                eprintln!("{}: all_user_login_history is not an array", file.display());
             }
+        } else {
+            eprintln!("{}: invalid all_user_login_history JSON", file.display());
         }
     }
 
-    if let Some(user_info) = data.get("UserInfo").and_then(parse_json_value) {
+    let user_info = match data.get("UserInfo") {
+        Some(value) => match parse_json_value(value) {
+            Some(user_info) => Some(user_info),
+            None => {
+                eprintln!("{}: invalid UserInfo JSON", file.display());
+                None
+            }
+        },
+        None => None,
+    };
+
+    if let Some(user_info) = user_info {
         let uid = non_empty(user_info.get("ID").and_then(js_string))
             .or_else(|| non_empty(user_info.get("PassId").and_then(js_string)));
         let token = non_empty(user_info.get("Token").and_then(js_string));
         let device = non_empty(user_info.get("DeviceID").and_then(js_string));
+        let mut missing = Vec::new();
+        if uid.is_none() {
+            missing.push("UID");
+        }
+        if token.is_none() {
+            missing.push("Token");
+        }
+        if device.is_none() {
+            missing.push("DeviceID");
+        }
 
         if let (Some(uid), Some(token), Some(device)) = (uid, token, device) {
             users.push(Credentials {
@@ -286,7 +362,34 @@ fn parse_yosdk_user_info(file: &Path) -> Result<Vec<Credentials>> {
                 mtime,
                 login_time: 0,
             });
+        } else {
+            eprintln!(
+                "{}: UserInfo skipped (missing {})",
+                file.display(),
+                missing.join(", ")
+            );
         }
+    }
+
+    if skipped_missing_uid + skipped_missing_token + skipped_missing_device > 0 {
+        eprintln!(
+            "{}: skipped login history entries (missing UID={}, token={}, DeviceID={})",
+            file.display(),
+            skipped_missing_uid,
+            skipped_missing_token,
+            skipped_missing_device
+        );
+    }
+
+    if users.is_empty() {
+        let keys = data
+            .as_object()
+            .map(|object| object.keys().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        eprintln!(
+            "{}: no usable account (top-level keys: {keys:?})",
+            file.display()
+        );
     }
 
     Ok(users)
