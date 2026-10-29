@@ -1,7 +1,9 @@
 const crypto = require('crypto');
+const childProcess = require('child_process');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const readline = require('readline');
 const protobuf = require('protobufjs');
 
 const REGION_ORDER = ['en', 'jp', 'kr', 'tw', 'cn'];
@@ -364,6 +366,161 @@ function compareUids(left, right) {
     return String(left).localeCompare(String(right), undefined, { numeric: true });
 }
 
+const ENV_FILE = path.join(process.cwd(), '.env');
+let _unityDeviceId;
+
+function parseEnvFile(text) {
+    const values = {};
+    for (const rawLine of text.replace(/^\uFEFF/, '').split(/\r?\n/)) {
+        const line = rawLine.trim();
+        if (!line || line.startsWith('#')) continue;
+        const equals = line.indexOf('=');
+        if (equals < 0) continue;
+        const key = line.slice(0, equals).trim();
+        if (!key) continue;
+        let value = line.slice(equals + 1).trim();
+        if ((value.startsWith('"') && value.endsWith('"'))
+            || (value.startsWith("'") && value.endsWith("'"))) {
+            value = value.slice(1, -1);
+        }
+        values[key] = value;
+    }
+    return values;
+}
+
+function readEnvFile() {
+    try {
+        return parseEnvFile(fs.readFileSync(ENV_FILE, 'utf8'));
+    } catch (_) {
+        return {};
+    }
+}
+
+function envValue(key) {
+    const fromFile = readEnvFile()[key];
+    if (fromFile && fromFile.trim()) return fromFile.trim();
+    const fromProcess = process.env[key];
+    return fromProcess && fromProcess.trim() ? fromProcess.trim() : null;
+}
+
+function loadSavedLogin(regionKey) {
+    const suffix = regionKey.toUpperCase();
+    const token = envValue(`TOKEN_${suffix}`);
+    if (!token) return null;
+    return {
+        uid: envValue(`UID_${suffix}`) || '',
+        token,
+        device: envValue('DEVICE') || '',
+    };
+}
+
+function saveLogin(regionKey, uid, token, device) {
+    try {
+        let lines = [];
+        try {
+            lines = fs.readFileSync(ENV_FILE, 'utf8').replace(/^\uFEFF/, '').split(/\r?\n/);
+        } catch (_) {
+        }
+        while (lines.length > 0 && lines[lines.length - 1] === '') lines.pop();
+
+        const suffix = regionKey.toUpperCase();
+        const tokenKey = `TOKEN_${suffix}`;
+        const uidKey = `UID_${suffix}`;
+        const hasDevice = lines.some((line) => {
+            const trimmed = line.trim();
+            if (!trimmed.startsWith('DEVICE=')) return false;
+            const value = trimmed.slice('DEVICE='.length).trim().replace(/^['"]|['"]$/g, '');
+            return Boolean(value);
+        });
+
+        lines = lines.filter((line) => {
+            const trimmed = line.trim();
+            return !trimmed.startsWith(`${tokenKey}=`) && !trimmed.startsWith(`${uidKey}=`);
+        });
+        if (!hasDevice) {
+            lines = lines.filter((line) => !line.trim().startsWith('DEVICE='));
+            lines.push(`DEVICE=${device}`);
+        }
+        lines.push(`${tokenKey}=${token}`);
+        lines.push(`${uidKey}=${uid}`);
+        fs.writeFileSync(ENV_FILE, `${lines.join('\n')}\n`, 'utf8');
+    } catch (err) {
+        console.error(`Could not save login to .env: ${err.message}`);
+    }
+}
+
+function runCommand(command, args) {
+    try {
+        const output = childProcess.execFileSync(command, args, {
+            encoding: 'utf8',
+            timeout: 10000,
+            windowsHide: true,
+        });
+        return output.trim() || null;
+    } catch (_) {
+        return null;
+    }
+}
+
+function queryPowerShell(className, field) {
+    return runCommand('powershell', [
+        '-NoProfile',
+        '-NonInteractive',
+        '-Command',
+        `(Get-CimInstance ${className}).${field}`,
+    ]);
+}
+
+function queryWmic(className, field) {
+    const output = runCommand('wmic', [className, 'get', field, '/value']);
+    if (!output) return null;
+    const prefix = `${field}=`;
+    for (const line of output.split(/\r?\n/)) {
+        const trimmed = line.trim();
+        if (!trimmed.startsWith(prefix)) continue;
+        const value = trimmed.slice(prefix.length).trim();
+        if (value) return value;
+    }
+    return null;
+}
+
+function queryMachineGuid() {
+    const output = runCommand('reg', [
+        'query',
+        'HKLM\\SOFTWARE\\Microsoft\\Cryptography',
+        '/v',
+        'MachineGuid',
+    ]);
+    if (!output) return null;
+    const match = /MachineGuid\s+REG_SZ\s+(.+)/i.exec(output);
+    return match ? match[1].trim() : null;
+}
+
+function getUnityDeviceId() {
+    if (_unityDeviceId !== undefined) return _unityDeviceId || null;
+
+    const parts = [];
+    for (const [className, field] of [
+        ['Win32_BaseBoard', 'SerialNumber'],
+        ['Win32_BIOS', 'SerialNumber'],
+        ['Win32_OperatingSystem', 'SerialNumber'],
+    ]) {
+        const value = queryPowerShell(className, field) || queryWmic(className, field);
+        if (value) parts.push(value);
+    }
+
+    if (parts.length === 0) {
+        _unityDeviceId = queryMachineGuid();
+    } else {
+        _unityDeviceId = crypto.createHash('sha1').update(parts.join(''), 'utf8').digest('hex');
+    }
+    return _unityDeviceId || null;
+}
+
+function defaultDevice() {
+    return envValue('DEVICE') || getUnityDeviceId();
+}
+
 function parseYoSdkUserInfo(file) {
     const data = readJsonFile(file);
     if (!data) {
@@ -392,7 +549,8 @@ function parseYoSdkUserInfo(file) {
             .sort((a, b) => Number(b.loginTime || 0) - Number(a.loginTime || 0));
         const currentUid = stringValue(data.ID);
         const currentToken = stringValue(data.Token);
-        const fallbackDevice = entries.map((entry) => stringValue(entry.DeviceID)).find(Boolean);
+        const fallbackDevice = entries.map((entry) => stringValue(entry.DeviceID)).find(Boolean)
+            || getUnityDeviceId();
 
         for (const entry of entries) {
             const uid = stringValue(entry.ID);
@@ -431,7 +589,7 @@ function parseYoSdkUserInfo(file) {
     if (userInfo && typeof userInfo === 'object' && !Array.isArray(userInfo)) {
         const uid = stringValue(userInfo.ID) || stringValue(userInfo.PassId);
         const token = stringValue(userInfo.Token);
-        const device = stringValue(userInfo.DeviceID);
+        const device = stringValue(userInfo.DeviceID) || getUnityDeviceId();
         const missing = [];
         if (!uid) missing.push('UID');
         if (!token) missing.push('Token');
@@ -758,7 +916,7 @@ function generateYostarAuthHeader(region, credentials, head, body) {
     }
 
     const SALT = '886c085e4a8d30a703367b120dd8353948405ec2';
-    const HEAD = Object.assign({
+    const HEAD = {
         Channel: 'pc',
         Platform: 'pc',
         Lang: region.authLang,
@@ -769,9 +927,10 @@ function generateYostarAuthHeader(region, credentials, head, body) {
         PID: region.pid,
         DeviceModel: DEVICE_MODEL,
         Time: Math.floor(Date.now() / 1000),
-        UID: credentials.uid,
-        Token: '',
-    }, head);
+    };
+    if (credentials.uid) HEAD.UID = credentials.uid;
+    HEAD.Token = '';
+    Object.assign(HEAD, head);
 
     const toSign = JSON.stringify(HEAD) + JSON.stringify(body) + SALT;
     const sign = crypto.createHash('md5').update(toSign, 'utf8').digest('hex').toUpperCase();
@@ -812,6 +971,144 @@ async function quickLogin(region, credentials, savedToken) {
 async function getAccountLoginToken(region, credentials) {
     console.log('Found saved Yostar token; trying quick-login...');
     return quickLogin(region, credentials, credentials.token);
+}
+
+function ask(promptText) {
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    return new Promise((resolve) => {
+        rl.question(promptText, (answer) => {
+            rl.close();
+            resolve(answer.trim());
+        });
+    });
+}
+
+async function selectRegion() {
+    if (!process.stdin.isTTY || !process.stdout.isTTY) {
+        throw new Error('No usable credentials. Run in a terminal to log in');
+    }
+
+    const loginRegions = REGION_ORDER
+        .map((regionKey) => REGIONS[regionKey])
+        .filter((region) => region.authMode !== 'cn');
+
+    console.log('Select a region:');
+    loginRegions.forEach((region, index) => {
+        console.log(`  ${index + 1}. ${region.label}`);
+    });
+    const input = await ask(`Region [1-${loginRegions.length}]: `);
+    const regionKey = normalizeRegion(input);
+    if (regionKey && loginRegions.some((region) => region.key === regionKey)) {
+        return REGIONS[regionKey];
+    }
+    if (!/^\d+$/.test(input)) throw new Error('Invalid region selection');
+    const index = Number(input);
+    if (index < 1 || index > loginRegions.length) throw new Error('Invalid region selection');
+    return loginRegions[index - 1];
+}
+
+function loginCredentials(device, uid = '') {
+    return { uid: uid || '', token: '', device };
+}
+
+async function postSdkJson(region, endpoint, bodyObj, device, uid = '') {
+    const url = `${region.sdkUrl}${endpoint}`;
+    const credentials = loginCredentials(device, uid);
+    const authHeader = generateYostarAuthHeader(region, credentials, {}, bodyObj);
+    const respBuf = await postBuffer(url, Buffer.from(JSON.stringify(bodyObj), 'utf8'), {
+        'Content-Type': 'application/json',
+        Authorization: authHeader,
+    });
+    const text = respBuf.toString('utf8');
+    let obj;
+    try {
+        obj = JSON.parse(text);
+    } catch (_) {
+        throw new Error(`${endpoint} returned invalid JSON: ${text.slice(0, 300)}`);
+    }
+    return { obj, text };
+}
+
+async function sendAuthCodeRequest(region, email, device, uid = '') {
+    const { obj, text } = await postSdkJson(region, '/yostar/send-code', { Account: email }, device, uid);
+    if (!obj || obj.Code !== 200) {
+        throw new Error(`/yostar/send-code failed: ${text.slice(0, 500)}`);
+    }
+}
+
+async function loginWithEmailCode(region, email, code, device, uid = '') {
+    const auth = await postSdkJson(region, '/yostar/get-auth', { Account: email, Code: code }, device, uid);
+    const authToken = auth.obj && auth.obj.Data && auth.obj.Data.Token;
+    if (!authToken) {
+        throw new Error(`/yostar/get-auth failed: ${auth.text.slice(0, 500)}`);
+    }
+
+    const login = await postSdkJson(region, '/user/login', {
+        OpenID: email,
+        Token: authToken,
+        Type: 'yostar',
+        UserName: email,
+        Secret: '',
+        CheckAccount: 0,
+    }, device, uid);
+    const user = extractSdkUser(login.obj);
+    if (!user || !user.Token || user.ID === undefined || user.ID === null || user.ID === '') {
+        throw new Error(`/user/login failed: ${login.text.slice(0, 500)}`);
+    }
+
+    return { accountLoginToken: user.Token, accountUid: user.ID };
+}
+
+async function trySavedLogin(region) {
+    const saved = loadSavedLogin(region.key);
+    if (!saved) return null;
+
+    const device = saved.device || defaultDevice();
+    if (!device) {
+        console.error(`Saved login failed (${region.label}): could not determine device ID`);
+        return null;
+    }
+
+    const credentials = {
+        uid: saved.uid,
+        token: saved.token,
+        device,
+    };
+    try {
+        const quick = await getAccountLoginToken(region, credentials);
+        console.log(`Using saved login (${region.label}, Yostar UID ${quick.accountUid})`);
+        return { credentials, quick };
+    } catch (err) {
+        console.error(`Saved login failed (${region.label}): ${err.message}`);
+        return null;
+    }
+}
+
+async function loginWithEmail(region) {
+    if (!process.stdin.isTTY || !process.stdout.isTTY) {
+        throw new Error('Email login requires an interactive terminal');
+    }
+
+    const device = defaultDevice();
+    if (!device) throw new Error('Could not determine device ID');
+    const saved = loadSavedLogin(region.key);
+    const uid = saved ? saved.uid : '';
+    const email = await ask(`Yostar email (${region.label}): `);
+    if (!email) throw new Error('Email is required');
+    console.log('Requesting Yostar code...');
+    await sendAuthCodeRequest(region, email, device, uid);
+    const code = await ask(`Enter code (${region.label}): `);
+    if (!code) throw new Error('Code is required');
+
+    const quick = await loginWithEmailCode(region, email, code, device, uid);
+    saveLogin(region.key, quick.accountUid, quick.accountLoginToken, device);
+    console.log(`Logged in (${region.label}, Yostar UID ${quick.accountUid})`);
+    const credentials = {
+        uid: String(quick.accountUid),
+        token: quick.accountLoginToken,
+        device,
+    };
+    return { credentials, quick };
 }
 
 async function doPlayerLogin(region, credentials, ikeToken, cipher, sessionKey, accountLoginToken, accountUid) {
@@ -1031,17 +1328,16 @@ async function fetchGameIdentity(region, sessionToken, cipher, sessionKey) {
     return { gameUid, gameName };
 }
 
-async function fetchRegionHistory(region, credentials, metadata) {
+async function fetchRegionHistory(region, credentials, quick, metadata) {
     const { banners, bannerById, storages } = buildCatalog(metadata);
 
     console.log(`Connecting to ${region.serverUrl}...`);
     const ike = await doIkeHandshake(region);
     console.log(`IKE ok (${ike.cipher === 1 ? 'ChaCha20-Poly1305' : 'AES-GCM'})`);
 
-    const { accountLoginToken, accountUid } = await getAccountLoginToken(region, credentials);
     const loginResp = await doPlayerLogin(
         region, credentials, ike.token, ike.cipher, ike.sessionKey,
-        accountLoginToken, accountUid,
+        quick.accountLoginToken, quick.accountUid,
     );
     const sessionToken = loginResp.Token;
     if (!sessionToken) throw new Error('Player login returned an empty session token');
@@ -1100,7 +1396,7 @@ async function fetchRegionHistory(region, credentials, metadata) {
     }
 
     return {
-        uid: String(accountUid),
+        uid: String(quick.accountUid),
         gameUid,
         gameName,
         banners,
@@ -1377,6 +1673,22 @@ function loadExistingRegion(regionKey, gameUid) {
     }
 }
 
+async function fetchAndWrite(region, credentials, quick, metadata) {
+    const regionKey = region.key;
+    const fetched = await fetchRegionHistory(region, credentials, quick, metadata);
+    const regionOutput = buildRegionOutput(
+        regionKey,
+        fetched,
+        loadExistingRegion(regionKey, fetched.gameUid),
+        metadata.itemData,
+    );
+    const outputFile = outputFileForAccount(regionKey, fetched.gameUid);
+    fs.writeFileSync(outputFile, JSON.stringify(regionOutput, null, 4), { encoding: 'utf8' });
+    console.log(`${region.label}: ${regionOutput.totals.pulls} pulls`);
+    console.log(`Wrote ${outputFile}`);
+    return regionOutput.totals.pulls;
+}
+
 function waitForExit() {
     if (!process.stdin.isTTY || !process.stdout.isTTY) {
         return;
@@ -1411,10 +1723,13 @@ function waitForExit() {
 
     const detectedRegions = REGION_ORDER
         .map((regionKey) => REGIONS[regionKey])
-        .filter((region) => findYoSdkCredentials(region.key).length > 0);
+        .filter((region) => findYoSdkCredentials(region.key).length > 0
+            || loadSavedLogin(region.key) !== null);
+    const noRegionsDetected = detectedRegions.length === 0;
+
     const detectedLabels = detectedRegions.map((region) => region.label).join(', ');
     console.log(`Detected ${detectedRegions.length} region${detectedRegions.length === 1 ? '' : 's'}:${detectedLabels ? ` ${detectedLabels}` : ''}`);
-    if (detectedRegions.length === 0) {
+    if (noRegionsDetected) {
         console.error('No credentials detected.');
     }
 
@@ -1429,28 +1744,57 @@ function waitForExit() {
             continue;
         }
 
+        if (accounts.length === 0) {
+            const saved = await trySavedLogin(region);
+            if (!saved) continue;
+            try {
+                const pulls = await fetchAndWrite(region, saved.credentials, saved.quick, metadata);
+                successCount += 1;
+                totalPulls += pulls;
+            } catch (err) {
+                console.error(`${region.label} failed: ${err.message}`);
+            }
+            continue;
+        }
+
+        let regionSuccess = false;
         for (const auto of accounts) {
             const credentials = regionCredentials(region, auto);
             if (!credentials) continue;
 
             try {
-                const fetched = await fetchRegionHistory(region, credentials, metadata);
-                const regionOutput = buildRegionOutput(
-                    regionKey,
-                    fetched,
-                    loadExistingRegion(regionKey, fetched.gameUid),
-                    metadata.itemData,
-                );
-                const outputFile = outputFileForAccount(regionKey, fetched.gameUid);
-                fs.writeFileSync(outputFile, JSON.stringify(regionOutput, null, 4), { encoding: 'utf8' });
+                const quick = await getAccountLoginToken(region, credentials);
+                const pulls = await fetchAndWrite(region, credentials, quick, metadata);
+                regionSuccess = true;
                 successCount += 1;
-                totalPulls += regionOutput.totals.pulls;
-                console.log(`${region.label}: ${regionOutput.totals.pulls} pulls`);
-                console.log(`Wrote ${outputFile}`);
+                totalPulls += pulls;
             } catch (err) {
                 console.error(`${region.label} failed: ${err.message}`);
             }
         }
+
+        if (!regionSuccess && loadSavedLogin(region.key)) {
+            const saved = await trySavedLogin(region);
+            if (saved) {
+                try {
+                    const pulls = await fetchAndWrite(region, saved.credentials, saved.quick, metadata);
+                    successCount += 1;
+                    totalPulls += pulls;
+                } catch (err) {
+                    console.error(`${region.label} failed: ${err.message}`);
+                }
+            }
+        }
+    }
+
+    if (noRegionsDetected && successCount === 0) {
+        const region = await selectRegion();
+        const saved = await trySavedLogin(region);
+        const { credentials, quick } = saved || await loginWithEmail(region);
+        const metadata = await loadMetadata(region);
+        const pulls = await fetchAndWrite(region, credentials, quick, metadata);
+        successCount += 1;
+        totalPulls += pulls;
     }
 
     if (successCount === 0) {

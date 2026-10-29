@@ -2,3 +2,4 @@ target/
 nodejs/node_modules/
 nodejs/dist/
 gacha.*.json
+.env

@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use anyhow::{anyhow, bail, Context, Result};
 use md5::{Digest, Md5};
 use prost::Message;
@@ -97,7 +99,9 @@ fn token_head(
     head.insert("PID".into(), Value::String(region.pid.into()));
     head.insert("DeviceModel".into(), Value::String(DEVICE_MODEL.into()));
     head.insert("Time".into(), Value::Number(Number::from(unix_now())));
-    head.insert("UID".into(), Value::String(credentials.uid.clone()));
+    if !credentials.uid.is_empty() {
+        head.insert("UID".into(), Value::String(credentials.uid.clone()));
+    }
     head.insert("Token".into(), Value::String(String::new()));
     if let Some(saved_token) = saved_token {
         head.insert("Token".into(), Value::String(saved_token.to_string()));
@@ -142,6 +146,115 @@ pub fn generate_yostar_auth_header(
 
 fn truncate(text: &str, limit: usize) -> String {
     text.chars().take(limit).collect()
+}
+
+fn login_credentials(device: &str, uid: &str) -> Credentials {
+    Credentials {
+        uid: uid.to_string(),
+        token: String::new(),
+        device: device.to_string(),
+        file: PathBuf::new(),
+        region: None,
+        mtime: 0,
+        login_time: 0,
+    }
+}
+
+async fn post_sdk_json(
+    client: &reqwest::Client,
+    region: &Region,
+    endpoint: &str,
+    body: &Value,
+    device: &str,
+    uid: &str,
+) -> Result<(Value, String)> {
+    let url = format!("{}{endpoint}", region.sdk_url);
+    let credentials = login_credentials(device, uid);
+    let auth_header = generate_yostar_auth_header(region, &credentials, None, body)?;
+
+    let mut headers = HeaderMap::new();
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    headers.insert(
+        AUTHORIZATION,
+        HeaderValue::from_str(&auth_header).context("Invalid Authorization header")?,
+    );
+
+    let response = post_buffer(client, &url, serde_json::to_vec(body)?, headers).await?;
+    let text = String::from_utf8_lossy(&response).into_owned();
+    let object: Value = serde_json::from_str(&text)
+        .map_err(|_| anyhow!("{endpoint} returned invalid JSON: {}", truncate(&text, 300)))?;
+    Ok((object, text))
+}
+
+pub async fn send_auth_code(
+    client: &reqwest::Client,
+    region: &Region,
+    email: &str,
+    device: &str,
+    uid: &str,
+) -> Result<()> {
+    let body = json!({ "Account": email });
+    let (object, text) =
+        post_sdk_json(client, region, "/yostar/send-code", &body, device, uid).await?;
+    if object.get("Code").and_then(Value::as_i64) != Some(200) {
+        bail!("/yostar/send-code failed: {}", truncate(&text, 500));
+    }
+    Ok(())
+}
+
+pub async fn login_with_email_code(
+    client: &reqwest::Client,
+    region: &Region,
+    email: &str,
+    code: &str,
+    device: &str,
+    uid: &str,
+) -> Result<QuickLogin> {
+    let auth_body = json!({ "Account": email, "Code": code });
+    let (auth_object, auth_text) =
+        post_sdk_json(client, region, "/yostar/get-auth", &auth_body, device, uid).await?;
+    let auth_token = auth_object
+        .get("Data")
+        .and_then(|data| data.get("Token"))
+        .and_then(Value::as_str)
+        .filter(|token| !token.is_empty())
+        .map(str::to_string)
+        .with_context(|| format!("/yostar/get-auth failed: {}", truncate(&auth_text, 500)))?;
+
+    let login_body = json!({
+        "OpenID": email,
+        "Token": auth_token,
+        "Type": "yostar",
+        "UserName": email,
+        "Secret": "",
+        "CheckAccount": 0,
+    });
+    let (login_object, login_text) =
+        post_sdk_json(client, region, "/user/login", &login_body, device, uid).await?;
+    let user = extract_sdk_user(&login_object)
+        .with_context(|| format!("/user/login failed: {}", truncate(&login_text, 500)))?;
+
+    let token = user
+        .get("Token")
+        .and_then(Value::as_str)
+        .filter(|token| !token.is_empty())
+        .map(str::to_string)
+        .with_context(|| format!("/user/login failed: {}", truncate(&login_text, 500)))?;
+    let uid = user
+        .get("ID")
+        .and_then(js_string)
+        .filter(|uid| !uid.is_empty())
+        .with_context(|| {
+            format!(
+                "/user/login response has no account ID: {}",
+                truncate(&login_text, 500)
+            )
+        })?;
+
+    Ok(QuickLogin {
+        account_login_token: token,
+        account_uid: uid,
+    })
 }
 
 fn extract_sdk_user(value: &Value) -> Option<&Value> {

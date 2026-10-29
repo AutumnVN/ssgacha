@@ -282,7 +282,10 @@ fn parse_yosdk_user_info(file: &Path) -> Result<Vec<Credentials>> {
                 let current_token = non_empty(data.get("Token").and_then(js_string));
                 let fallback_device = entries
                     .iter()
-                    .find_map(|entry| non_empty(entry.get("DeviceID").and_then(js_string)));
+                    .find_map(|entry| non_empty(entry.get("DeviceID").and_then(js_string)))
+                    .or_else(|| {
+                        crate::device::get_unity_device_unique_identifier().map(str::to_string)
+                    });
 
                 for entry in entries {
                     let Some(uid) = non_empty(entry.get("ID").and_then(js_string)) else {
@@ -340,7 +343,8 @@ fn parse_yosdk_user_info(file: &Path) -> Result<Vec<Credentials>> {
         let uid = non_empty(user_info.get("ID").and_then(js_string))
             .or_else(|| non_empty(user_info.get("PassId").and_then(js_string)));
         let token = non_empty(user_info.get("Token").and_then(js_string));
-        let device = non_empty(user_info.get("DeviceID").and_then(js_string));
+        let device = non_empty(user_info.get("DeviceID").and_then(js_string))
+            .or_else(|| crate::device::get_unity_device_unique_identifier().map(str::to_string));
         let mut missing = Vec::new();
         if uid.is_none() {
             missing.push("UID");

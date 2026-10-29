@@ -1,14 +1,17 @@
 mod credentials;
 mod crypto;
+mod device;
 mod metadata;
 mod net;
 mod output;
 mod proto;
 mod regions;
 mod sdk;
+mod session;
 
 use std::collections::BTreeSet;
 use std::io::{IsTerminal, Write};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
@@ -22,11 +25,12 @@ use crate::output::{
     FetchedRegion, Pull,
 };
 use crate::proto::{GachaHistories, GachaInformationResp, PlayerInfo, Ui32};
-use crate::regions::{region_by_key, Region, REGION_ORDER};
+use crate::regions::{normalize_region, region_by_key, AuthMode, Region, REGIONS, REGION_ORDER};
 use crate::sdk::{
-    do_player_login, get_account_login_token, send_game_request, MSG_GACHA_HISTORIES_REQ,
-    MSG_GACHA_HISTORIES_SUCCEED_ACK, MSG_GACHA_INFORMATION_REQ, MSG_GACHA_INFORMATION_SUCCEED_ACK,
-    MSG_PLAYER_DATA_REQ, MSG_PLAYER_DATA_SUCCEED_ACK,
+    do_player_login, get_account_login_token, login_with_email_code, send_auth_code,
+    send_game_request, QuickLogin, MSG_GACHA_HISTORIES_REQ, MSG_GACHA_HISTORIES_SUCCEED_ACK,
+    MSG_GACHA_INFORMATION_REQ, MSG_GACHA_INFORMATION_SUCCEED_ACK, MSG_PLAYER_DATA_REQ,
+    MSG_PLAYER_DATA_SUCCEED_ACK,
 };
 
 async fn fetch_game_identity(
@@ -67,6 +71,7 @@ async fn fetch_region_history(
     client: &reqwest::Client,
     region: &Region,
     credentials: &Credentials,
+    quick: &QuickLogin,
     metadata: &metadata::Metadata,
 ) -> Result<FetchedRegion> {
     let catalog = build_catalog(metadata)?;
@@ -82,7 +87,6 @@ async fn fetch_region_history(
         }
     );
 
-    let quick = get_account_login_token(client, region, credentials).await?;
     let session_token = do_player_login(
         client,
         region,
@@ -191,7 +195,7 @@ async fn fetch_region_history(
     }
 
     Ok(FetchedRegion {
-        uid: quick.account_uid,
+        uid: quick.account_uid.clone(),
         game_uid,
         game_name,
         catalog,
@@ -199,6 +203,161 @@ async fn fetch_region_history(
         gacha_info,
         errors,
     })
+}
+
+async fn fetch_and_write(
+    client: &reqwest::Client,
+    region: &Region,
+    credentials: &Credentials,
+    quick: &QuickLogin,
+    metadata: &metadata::Metadata,
+) -> Result<u64> {
+    let fetched = fetch_region_history(client, region, credentials, quick, metadata).await?;
+    let output_file = output_file_for_account(region.key, &fetched.game_uid)?;
+    let existing = load_existing_region(&output_file);
+    let region_output =
+        build_region_output(region.key, &fetched, existing.as_ref(), &metadata.item_data)?;
+    write_region_output(&output_file, &region_output)?;
+    println!("{}: {} pulls", region.label, region_output.totals.pulls);
+    println!("Wrote {}", output_file.display());
+    Ok(region_output.totals.pulls)
+}
+
+fn generated_device() -> Option<String> {
+    session::configured_device()
+        .or_else(|| device::get_unity_device_unique_identifier().map(str::to_string))
+}
+
+async fn try_saved_login(
+    client: &reqwest::Client,
+    region: &Region,
+) -> Option<(Credentials, QuickLogin)> {
+    let saved = session::load_saved_login(region.key)?;
+    let device = if saved.device.is_empty() {
+        match generated_device() {
+            Some(device) => device,
+            None => {
+                eprintln!(
+                    "Saved login failed ({}): could not determine device ID",
+                    region.label
+                );
+                return None;
+            }
+        }
+    } else {
+        saved.device
+    };
+    let credentials = Credentials {
+        uid: saved.uid,
+        token: saved.token,
+        device,
+        file: PathBuf::from("<saved login>"),
+        region: Some(region.key),
+        mtime: 0,
+        login_time: 0,
+    };
+
+    match get_account_login_token(client, region, &credentials).await {
+        Ok(quick) => {
+            println!(
+                "Using saved login ({}, Yostar UID {})",
+                region.label, quick.account_uid
+            );
+            Some((credentials, quick))
+        }
+        Err(error) => {
+            eprintln!("Saved login failed ({}): {error:#}", region.label);
+            None
+        }
+    }
+}
+
+fn prompt(label: &str) -> Result<String> {
+    print!("{label}");
+    std::io::stdout().flush()?;
+    let mut line = String::new();
+    let read = std::io::stdin().read_line(&mut line)?;
+    if read == 0 {
+        bail!("No input");
+    }
+    let value = line.trim().to_string();
+    if value.is_empty() {
+        bail!("Input cannot be empty");
+    }
+    Ok(value)
+}
+
+fn select_region() -> Result<&'static Region> {
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        bail!("No usable credentials. Run in a terminal to log in");
+    }
+
+    let login_regions: Vec<&Region> = REGIONS
+        .iter()
+        .filter(|region| region.auth_mode != AuthMode::Cn)
+        .collect();
+
+    println!("Select a region:");
+    for (index, region) in login_regions.iter().enumerate() {
+        println!("  {}. {}", index + 1, region.label);
+    }
+    let input = prompt(&format!("Region [1-{}]: ", login_regions.len()))?;
+    if let Some(region) = normalize_region(&input).and_then(region_by_key) {
+        if login_regions
+            .iter()
+            .any(|candidate| candidate.key == region.key)
+        {
+            return Ok(region);
+        }
+    }
+    let index: usize = input.parse().context("Invalid region selection")?;
+    login_regions
+        .get(index.wrapping_sub(1))
+        .copied()
+        .context("Invalid region selection")
+}
+
+async fn login_with_email(
+    client: &reqwest::Client,
+    region: &Region,
+) -> Result<(Credentials, QuickLogin)> {
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        bail!("Email login requires an interactive terminal");
+    }
+
+    let device = generated_device().context("Could not determine device ID")?;
+    let saved_uid = session::load_saved_login(region.key)
+        .map(|saved| saved.uid)
+        .unwrap_or_default();
+    let email = prompt(&format!("Yostar email ({}): ", region.label))?;
+    println!("Requesting Yostar code...");
+    send_auth_code(client, region, &email, &device, &saved_uid).await?;
+    let code = prompt(&format!("Enter code ({}): ", region.label))?;
+    let quick = login_with_email_code(client, region, &email, &code, &device, &saved_uid).await?;
+
+    if let Err(error) = session::save_login(
+        region.key,
+        &quick.account_uid,
+        &quick.account_login_token,
+        &device,
+    ) {
+        eprintln!("Could not save login to .env: {error:#}");
+    }
+    println!(
+        "Logged in ({}, Yostar UID {})",
+        region.label, quick.account_uid
+    );
+
+    let credentials = Credentials {
+        uid: quick.account_uid.clone(),
+        token: quick.account_login_token.clone(),
+        device,
+        file: PathBuf::from("<email login>"),
+        region: Some(region.key),
+        mtime: 0,
+        login_time: 0,
+    };
+    Ok((credentials, quick))
 }
 
 async fn run() -> Result<()> {
@@ -210,11 +369,15 @@ async fn run() -> Result<()> {
         .iter()
         .filter_map(|key| region_by_key(key))
         .filter(|region| {
-            find_yosdk_credentials(region.key)
+            let has_game_credentials = find_yosdk_credentials(region.key)
                 .map(|credentials| !credentials.is_empty())
-                .unwrap_or(false)
+                .unwrap_or(false);
+            let has_saved_login = session::load_saved_login(region.key).is_some();
+            has_game_credentials || has_saved_login
         })
         .collect();
+    let no_regions_detected = detected.is_empty();
+
     let labels = detected
         .iter()
         .map(|region| region.label)
@@ -230,7 +393,7 @@ async fn run() -> Result<()> {
             format!(" {labels}")
         }
     );
-    if detected.is_empty() {
+    if no_regions_detected {
         eprintln!("No credentials detected.");
     }
 
@@ -248,10 +411,20 @@ async fn run() -> Result<()> {
         };
 
         if accounts.is_empty() {
-            eprintln!("{}: no accounts to fetch", region.label);
+            let Some((credentials, quick)) = try_saved_login(&client, region).await else {
+                continue;
+            };
+            match fetch_and_write(&client, region, &credentials, &quick, &metadata).await {
+                Ok(pulls) => {
+                    success_count += 1;
+                    total_pulls += pulls;
+                }
+                Err(error) => eprintln!("{} failed: {error:#}", region.label),
+            }
             continue;
         }
 
+        let mut region_success = false;
         for credentials in accounts {
             println!(
                 "Using {} ({}, Yostar UID {})",
@@ -261,30 +434,46 @@ async fn run() -> Result<()> {
             );
 
             let region_result: Result<u64> = async {
-                let fetched = fetch_region_history(&client, region, credentials, &metadata).await?;
-                let output_file = output_file_for_account(region.key, &fetched.game_uid)?;
-                let existing = load_existing_region(&output_file);
-                let region_output = build_region_output(
-                    region.key,
-                    &fetched,
-                    existing.as_ref(),
-                    &metadata.item_data,
-                )?;
-                write_region_output(&output_file, &region_output)?;
-                println!("{}: {} pulls", region.label, region_output.totals.pulls);
-                println!("Wrote {}", output_file.display());
-                Ok(region_output.totals.pulls)
+                let quick = get_account_login_token(&client, region, credentials).await?;
+                fetch_and_write(&client, region, credentials, &quick, &metadata).await
             }
             .await;
 
             match region_result {
                 Ok(pulls) => {
+                    region_success = true;
                     success_count += 1;
                     total_pulls += pulls;
                 }
                 Err(error) => eprintln!("{} failed: {error:#}", region.label),
             }
         }
+
+        if !region_success && session::load_saved_login(region.key).is_some() {
+            if let Some((credentials, quick)) = try_saved_login(&client, region).await {
+                match fetch_and_write(&client, region, &credentials, &quick, &metadata).await {
+                    Ok(pulls) => {
+                        success_count += 1;
+                        total_pulls += pulls;
+                    }
+                    Err(error) => eprintln!("{} failed: {error:#}", region.label),
+                }
+            }
+        }
+    }
+
+    if no_regions_detected && success_count == 0 {
+        let region = select_region()?;
+        let (credentials, quick) = match try_saved_login(&client, region).await {
+            Some(login) => login,
+            None => login_with_email(&client, region).await?,
+        };
+        let metadata = load_metadata(&client, region)
+            .await
+            .with_context(|| format!("Loading {} metadata", region.label))?;
+        let pulls = fetch_and_write(&client, region, &credentials, &quick, &metadata).await?;
+        success_count += 1;
+        total_pulls += pulls;
     }
 
     if success_count == 0 {
